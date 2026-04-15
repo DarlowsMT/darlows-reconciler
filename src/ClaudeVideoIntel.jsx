@@ -46,10 +46,16 @@ const COLORS = {
 
 // ─── API CALLS ───────────────────────────────────────────────
 
-async function callClaude(system, userMessage, maxTokens = 1000) {
+async function callClaude(apiKey, system, userMessage, maxTokens = 1000) {
+  if (!apiKey) throw new Error("Missing API key. Paste your Anthropic API key above.");
   const res = await fetch(API_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
       max_tokens: maxTokens,
@@ -67,7 +73,7 @@ async function callClaude(system, userMessage, maxTokens = 1000) {
   return text;
 }
 
-async function searchClaudeVideos() {
+async function searchClaudeVideos(apiKey) {
   const today = new Date().toLocaleDateString("en-US", {
     weekday: "long",
     year: "numeric",
@@ -102,6 +108,7 @@ Respond with ONLY a JSON object — no markdown, no backticks, no extra text. St
 Categories must be one of: Tutorial, News, Feature Demo, Developer, Review`;
 
   const raw = await callClaude(
+    apiKey,
     system,
     "Generate the weekly Claude AI YouTube video report as JSON.",
     1000
@@ -109,7 +116,7 @@ Categories must be one of: Tutorial, News, Feature Demo, Developer, Review`;
   return extractJSON(raw);
 }
 
-async function summarizeVideo(url) {
+async function summarizeVideo(apiKey, url) {
   const system = `You are a YouTube video analyst specializing in AI content. Given a YouTube URL, generate a realistic and detailed summary of what that video likely covers based on the URL structure, video ID, and your knowledge of Claude AI content on YouTube.
 
 Respond with ONLY a JSON object — no markdown, no backticks, no extra text. Start your response with { and end with }.
@@ -129,6 +136,7 @@ Respond with ONLY a JSON object — no markdown, no backticks, no extra text. St
 Categories: Tutorial, News, Feature Demo, Developer, Review, Other`;
 
   const raw = await callClaude(
+    apiKey,
     system,
     `Summarize this YouTube video: ${url}`,
     1000
@@ -393,6 +401,16 @@ export default function ClaudeVideoIntel() {
   const [error, setError] = useState(null);
   const [lastFetched, setLastFetched] = useState(null);
 
+  // API key (persisted to localStorage)
+  const [apiKey, setApiKey] = useState(
+    () => localStorage.getItem("anthropic_api_key") || ""
+  );
+  const [showKey, setShowKey] = useState(false);
+  useEffect(() => {
+    if (apiKey) localStorage.setItem("anthropic_api_key", apiKey);
+    else localStorage.removeItem("anthropic_api_key");
+  }, [apiKey]);
+
   // Summarizer
   const [pasteUrl, setPasteUrl] = useState("");
   const [summaries, setSummaries] = useState([]);
@@ -403,7 +421,7 @@ export default function ClaudeVideoIntel() {
     setLoading(true);
     setError(null);
     try {
-      const r = await searchClaudeVideos();
+      const r = await searchClaudeVideos(apiKey);
       setReport(r);
       setLastFetched(new Date());
     } catch (e) {
@@ -419,12 +437,12 @@ export default function ClaudeVideoIntel() {
     setSummarizing(true);
     setSumError(null);
     try {
-      const result = await summarizeVideo(url);
+      const result = await summarizeVideo(apiKey, url);
       setSummaries((prev) => [{ ...result, url }, ...prev]);
       setPasteUrl("");
     } catch (e) {
       setSumError(
-        "Couldn't summarize that video. Make sure it's a valid YouTube URL."
+        `Couldn't summarize that video: ${e.message}`
       );
     } finally {
       setSummarizing(false);
@@ -543,6 +561,76 @@ export default function ClaudeVideoIntel() {
           <div style={{ display: "flex", gap: 4, paddingBottom: 0 }}>
             <TabBtn id="discover" label="Daily Discovery" icon="🔍" />
             <TabBtn id="summarize" label="Summarize a Video" icon="📋" />
+          </div>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              padding: "12px 0 16px",
+            }}
+          >
+            <span
+              style={{
+                fontSize: 11,
+                color: COLORS.muted,
+                fontFamily: "monospace",
+                textTransform: "uppercase",
+                letterSpacing: "0.08em",
+                whiteSpace: "nowrap",
+              }}
+            >
+              🔑 API Key
+            </span>
+            <input
+              type={showKey ? "text" : "password"}
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder="sk-ant-..."
+              style={{
+                flex: 1,
+                padding: "8px 12px",
+                background: COLORS.bg,
+                border: `1px solid ${apiKey ? COLORS.border : COLORS.accentDim}`,
+                borderRadius: 6,
+                color: COLORS.text,
+                fontSize: 12,
+                fontFamily: "monospace",
+                outline: "none",
+              }}
+            />
+            <button
+              onClick={() => setShowKey((s) => !s)}
+              style={{
+                padding: "8px 12px",
+                background: "transparent",
+                color: COLORS.muted,
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 6,
+                fontSize: 11,
+                cursor: "pointer",
+                fontFamily: "monospace",
+              }}
+            >
+              {showKey ? "Hide" : "Show"}
+            </button>
+            {apiKey && (
+              <button
+                onClick={() => setApiKey("")}
+                style={{
+                  padding: "8px 12px",
+                  background: "transparent",
+                  color: COLORS.muted,
+                  border: `1px solid ${COLORS.border}`,
+                  borderRadius: 6,
+                  fontSize: 11,
+                  cursor: "pointer",
+                  fontFamily: "monospace",
+                }}
+              >
+                Clear
+              </button>
+            )}
           </div>
         </div>
       </div>
