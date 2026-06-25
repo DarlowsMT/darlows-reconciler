@@ -25,6 +25,11 @@ const COLORS = {
   yellow: "#eab308",
 };
 
+const SPEAKER_COLORS = [
+  "#f97316", "#3b82f6", "#22c55e", "#eab308", "#c084fc", "#f472b6",
+  "#06b6d4", "#a3e635",
+];
+
 const BTN = {
   padding: "8px 16px",
   borderRadius: 6,
@@ -60,14 +65,31 @@ function extractJSON(text) {
 function fmtDuration(ms) {
   const s = Math.floor(ms / 1000);
   const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
+  const mn = Math.floor((s % 3600) / 60);
   const sec = s % 60;
   const pad = (n) => String(n).padStart(2, "0");
-  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+  return h > 0 ? `${h}:${pad(mn)}:${pad(sec)}` : `${pad(mn)}:${pad(sec)}`;
+}
+
+function fmtTs(ms) {
+  const s = Math.floor(ms / 1000);
+  const mn = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${String(mn).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 }
 
 function wc(text) {
   return text.trim() ? text.trim().split(/\s+/).length : 0;
+}
+
+function segsToText(segs) {
+  return segs.map((s) => s.text).join(" ");
+}
+
+function segsToLabeled(segs, names) {
+  return segs
+    .map((s) => `[${names[s.speaker] || `Speaker ${s.speaker}`}]: ${s.text}`)
+    .join("\n");
 }
 
 function splitSentences(text, maxLen) {
@@ -104,6 +126,27 @@ async function clipCopy(text) {
   }
 }
 
+function migrateMeeting(m) {
+  if (!m.segments) {
+    m.segments = m.transcript
+      ? [{ id: "0", text: m.transcript, ts: 0, speaker: 1, highlight: false }]
+      : [];
+    delete m.transcript;
+  }
+  if (!m.speakerNames) m.speakerNames = {};
+  if (!m.liveNotes) m.liveNotes = [];
+  if (!m.chatHistory) m.chatHistory = [];
+  return m;
+}
+
+function speakerColor(n) {
+  return SPEAKER_COLORS[(n - 1) % SPEAKER_COLORS.length];
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 // ─── Claude API ─────────────────────────────────────────────
 
 async function callClaude(apiKey, system, userMessage, maxTokens = 1000) {
@@ -132,7 +175,9 @@ async function callClaude(apiKey, system, userMessage, maxTokens = 1000) {
   return text;
 }
 
-const SUM_PROMPT = `You are a meeting analyst. Given a meeting transcript (or a set of interim chunk summaries), produce a single strict JSON object and NOTHING else.
+// ── Summary
+
+const SUM_PROMPT = `You are a meeting analyst. Given a meeting transcript with speaker labels, produce a single strict JSON object and NOTHING else.
 
 Schema:
 {
@@ -147,40 +192,37 @@ Schema:
 
 If a field has no content, use an empty array or null. Do not invent information not in the transcript.`;
 
-async function summarize(transcript, apiKey, focus = "") {
+async function summarizeMeeting(transcript, apiKey, focus = "") {
   const extra = focus.trim()
     ? `\n\nAdditional focus: ${focus.trim()}`
     : "";
-
   if (transcript.length <= 12000) {
-    const raw = await callClaude(
-      apiKey,
-      SUM_PROMPT + extra,
-      `Meeting transcript:\n\n${transcript}`,
-      1500
+    return extractJSON(
+      await callClaude(apiKey, SUM_PROMPT + extra, `Meeting transcript:\n\n${transcript}`, 1500)
     );
-    return extractJSON(raw);
   }
-
   const chunks = splitSentences(transcript, 8000);
   const partials = [];
   for (let i = 0; i < chunks.length; i++) {
-    const raw = await callClaude(
-      apiKey,
-      `You are a meeting analyst. Summarize transcript chunk ${i + 1}/${chunks.length} into compact JSON: { keyPoints, actionItems, decisions, topics, sentiment }. Be thorough but concise.`,
-      `Chunk ${i + 1}/${chunks.length}:\n\n${chunks[i]}`,
-      800
+    partials.push(
+      extractJSON(
+        await callClaude(
+          apiKey,
+          `You are a meeting analyst. Summarize transcript chunk ${i + 1}/${chunks.length} into compact JSON: { keyPoints, actionItems, decisions, topics, sentiment }. Be concise.`,
+          `Chunk ${i + 1}/${chunks.length}:\n\n${chunks[i]}`,
+          800
+        )
+      )
     );
-    partials.push(extractJSON(raw));
   }
-
-  const raw = await callClaude(
-    apiKey,
-    SUM_PROMPT + extra,
-    `Merge these ${partials.length} chunk summaries into one meeting summary. Deduplicate and synthesize.\n\n${JSON.stringify(partials, null, 2)}`,
-    1500
+  return extractJSON(
+    await callClaude(
+      apiKey,
+      SUM_PROMPT + extra,
+      `Merge these ${partials.length} chunk summaries into one meeting summary. Deduplicate and synthesize.\n\n${JSON.stringify(partials, null, 2)}`,
+      1500
+    )
   );
-  return extractJSON(raw);
 }
 
 function toMarkdown(s) {
@@ -210,6 +252,61 @@ function toMarkdown(s) {
   return md;
 }
 
+// ── Live notes
+
+async function extractLiveNotes(text, apiKey) {
+  const raw = await callClaude(
+    apiKey,
+    `You are a real-time meeting note-taker. Extract the most important information from this transcript chunk. Respond with ONLY a JSON object:
+{
+  "keyPoints": ["concise point 1", "..."],
+  "actionItems": ["action 1", "..."],
+  "decisions": ["decision 1", "..."]
+}
+Be very concise. Only genuinely important items. Empty arrays if nothing notable.`,
+    `Transcript chunk:\n\n${text}`,
+    500
+  );
+  return extractJSON(raw);
+}
+
+// ── Chat
+
+async function chatAboutMeeting(question, transcript, history, apiKey) {
+  let msg = `Meeting transcript:\n\n${transcript}\n\n`;
+  if (history.length > 0) {
+    msg += "Previous Q&A:\n";
+    for (const h of history.slice(-6)) {
+      msg += `Q: ${h.q}\nA: ${h.a}\n\n`;
+    }
+  }
+  msg += `New question: ${question}`;
+  return callClaude(
+    apiKey,
+    "You are a helpful meeting assistant. Answer questions about the meeting accurately and concisely based only on the transcript. If the answer is not in the transcript, say so.",
+    msg,
+    800
+  );
+}
+
+// ── Polish
+
+async function polishTranscript(text, apiKey) {
+  return callClaude(
+    apiKey,
+    `You are a transcript editor. Clean up this speech-to-text transcript:
+- Fix grammar, punctuation, and capitalization
+- Correct likely misheard words based on context
+- Break into natural paragraphs
+- Preserve the speaker's original meaning exactly
+- Keep speaker labels like [Speaker 1]: intact
+- Do NOT add, remove, or change the substance
+Return ONLY the cleaned transcript text.`,
+    text,
+    3000
+  );
+}
+
 // ─── Hooks ──────────────────────────────────────────────────
 
 function useSpeechRecognition(onFinal, onInterim, onError) {
@@ -222,15 +319,9 @@ function useSpeechRecognition(onFinal, onInterim, onError) {
   const cbFinal = useRef(onFinal);
   const cbInterim = useRef(onInterim);
   const cbError = useRef(onError);
-  useEffect(() => {
-    cbFinal.current = onFinal;
-  }, [onFinal]);
-  useEffect(() => {
-    cbInterim.current = onInterim;
-  }, [onInterim]);
-  useEffect(() => {
-    cbError.current = onError;
-  }, [onError]);
+  useEffect(() => { cbFinal.current = onFinal; }, [onFinal]);
+  useEffect(() => { cbInterim.current = onInterim; }, [onInterim]);
+  useEffect(() => { cbError.current = onError; }, [onError]);
 
   const recRef = useRef(null);
   const alive = useRef(false);
@@ -244,7 +335,6 @@ function useSpeechRecognition(onFinal, onInterim, onError) {
     rec.continuous = true;
     rec.interimResults = true;
     rec.lang = "en-US";
-
     rec.onresult = (e) => {
       let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -254,7 +344,6 @@ function useSpeechRecognition(onFinal, onInterim, onError) {
       cbInterim.current(interim);
       retries.current = 0;
     };
-
     rec.onerror = (e) => {
       if (e.error === "no-speech") return;
       if (e.error === "not-allowed" || e.error === "audio-capture") {
@@ -270,12 +359,8 @@ function useSpeechRecognition(onFinal, onInterim, onError) {
       }
       cbError.current(`Speech recognition error: ${e.error}`);
     };
-
     rec.onend = () => {
-      if (!alive.current) {
-        setRecording(false);
-        return;
-      }
+      if (!alive.current) { setRecording(false); return; }
       retries.current++;
       if (retries.current > 50) {
         alive.current = false;
@@ -296,7 +381,6 @@ function useSpeechRecognition(onFinal, onInterim, onError) {
         }
       }, delay);
     };
-
     return rec;
   }, []);
   useEffect(() => { buildRef.current = build; }, [build]);
@@ -307,13 +391,8 @@ function useSpeechRecognition(onFinal, onInterim, onError) {
     retries.current = 0;
     const rec = build();
     recRef.current = rec;
-    try {
-      rec.start();
-      setRecording(true);
-      setPaused(false);
-    } catch {
-      cbError.current("Failed to start speech recognition.");
-    }
+    try { rec.start(); setRecording(true); setPaused(false); }
+    catch { cbError.current("Failed to start speech recognition."); }
   }, [supported, build]);
 
   const stop = useCallback(() => {
@@ -337,22 +416,15 @@ function useSpeechRecognition(onFinal, onInterim, onError) {
     retries.current = 0;
     const rec = build();
     recRef.current = rec;
-    try {
-      rec.start();
-      setPaused(false);
-    } catch {
-      cbError.current("Failed to resume recognition.");
-    }
+    try { rec.start(); setPaused(false); }
+    catch { cbError.current("Failed to resume recognition."); }
   }, [supported, build]);
 
-  useEffect(
-    () => () => {
-      alive.current = false;
-      clearTimeout(timer.current);
-      recRef.current?.stop();
-    },
-    []
-  );
+  useEffect(() => () => {
+    alive.current = false;
+    clearTimeout(timer.current);
+    recRef.current?.stop();
+  }, []);
 
   return { supported, recording, paused, start, stop, pause, resume };
 }
@@ -360,40 +432,35 @@ function useSpeechRecognition(onFinal, onInterim, onError) {
 function useMeetings() {
   const init = (() => {
     try {
-      return JSON.parse(localStorage.getItem(KEYS.meetings) || "[]");
-    } catch {
-      return [];
-    }
+      return JSON.parse(localStorage.getItem(KEYS.meetings) || "[]").map(migrateMeeting);
+    } catch { return []; }
   })();
 
   const [meetings, setMeetings] = useState(init);
-  const [currentId, setCurrentId] = useState(
-    init.length > 0 ? init[0].id : null
-  );
+  const [currentId, setCurrentId] = useState(init.length > 0 ? init[0].id : null);
   const ref = useRef(meetings);
   useEffect(() => { ref.current = meetings; }, [meetings]);
 
   const persist = useCallback((list) => {
-    try {
-      localStorage.setItem(KEYS.meetings, JSON.stringify(list));
-      return true;
-    } catch {
-      return false;
-    }
+    try { localStorage.setItem(KEYS.meetings, JSON.stringify(list)); return true; }
+    catch { return false; }
   }, []);
 
   const current = meetings.find((m) => m.id === currentId) || null;
 
   const create = useCallback(() => {
-    const m = {
+    const m = migrateMeeting({
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
       title: "Untitled Meeting",
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      transcript: "",
+      segments: [],
+      speakerNames: {},
       summary: null,
+      liveNotes: [],
+      chatHistory: [],
       durationMs: 0,
-    };
+    });
     const next = [m, ...ref.current];
     setMeetings(next);
     setCurrentId(m.id);
@@ -401,148 +468,55 @@ function useMeetings() {
     return m;
   }, [persist]);
 
-  const update = useCallback(
-    (id, changes) => {
-      const next = ref.current.map((m) =>
-        m.id === id ? { ...m, ...changes, updatedAt: Date.now() } : m
-      );
-      setMeetings(next);
-      return persist(next);
-    },
-    [persist]
-  );
+  const update = useCallback((id, changes) => {
+    const next = ref.current.map((m) =>
+      m.id === id ? { ...m, ...changes, updatedAt: Date.now() } : m
+    );
+    setMeetings(next);
+    return persist(next);
+  }, [persist]);
 
-  const remove = useCallback(
-    (id) => {
-      const next = ref.current.filter((m) => m.id !== id);
-      setMeetings(next);
-      setCurrentId((prev) => (prev === id ? null : prev));
-      persist(next);
-    },
-    [persist]
-  );
+  const remove = useCallback((id) => {
+    const next = ref.current.filter((m) => m.id !== id);
+    setMeetings(next);
+    setCurrentId((prev) => (prev === id ? null : prev));
+    persist(next);
+  }, [persist]);
 
   const load = useCallback((id) => setCurrentId(id), []);
-
   const clearAll = useCallback(() => {
     setMeetings([]);
     setCurrentId(null);
     localStorage.removeItem(KEYS.meetings);
   }, []);
-
   const exportAll = useCallback(() => {
-    downloadFile(
-      "meetings-export.json",
-      JSON.stringify(ref.current, null, 2),
-      "application/json"
-    );
+    downloadFile("meetings-export.json", JSON.stringify(ref.current, null, 2), "application/json");
   }, []);
 
-  return {
-    meetings,
-    current,
-    currentId,
-    create,
-    update,
-    remove,
-    load,
-    clearAll,
-    exportAll,
-  };
+  return { meetings, current, currentId, create, update, remove, load, clearAll, exportAll };
 }
 
-// ─── Small components ───────────────────────────────────────
+// ─── Components ─────────────────────────────────────────────
 
 function Spinner({ size = 16 }) {
   return (
-    <span
-      style={{
-        display: "inline-block",
-        width: size,
-        height: size,
-        border: `2px solid ${COLORS.border}`,
-        borderTopColor: COLORS.accent,
-        borderRadius: "50%",
-        animation: "mlspin 0.6s linear infinite",
-        verticalAlign: "middle",
-      }}
-    />
+    <span style={{ display: "inline-block", width: size, height: size, border: `2px solid ${COLORS.border}`, borderTopColor: COLORS.accent, borderRadius: "50%", animation: "mlspin 0.6s linear infinite", verticalAlign: "middle" }} />
   );
 }
 
 function Toast({ message, type }) {
-  const bg =
-    type === "error" ? COLORS.red : type === "success" ? COLORS.green : COLORS.blue;
-  return (
-    <div
-      style={{
-        background: bg,
-        color: "#fff",
-        padding: "8px 16px",
-        borderRadius: 6,
-        fontSize: 13,
-        boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
-        maxWidth: 300,
-      }}
-    >
-      {message}
-    </div>
-  );
+  const bg = type === "error" ? COLORS.red : type === "success" ? COLORS.green : COLORS.blue;
+  return <div style={{ background: bg, color: "#fff", padding: "8px 16px", borderRadius: 6, fontSize: 13, boxShadow: "0 4px 12px rgba(0,0,0,0.4)", maxWidth: 300 }}>{message}</div>;
 }
 
 function ConfirmDialog({ message, onConfirm, onCancel }) {
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.6)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 1000,
-      }}
-      onClick={onCancel}
-    >
-      <div
-        style={{
-          background: COLORS.card,
-          border: `1px solid ${COLORS.border}`,
-          borderRadius: 12,
-          padding: 24,
-          maxWidth: 400,
-          width: "90%",
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <p
-          style={{
-            color: COLORS.text,
-            fontSize: 14,
-            marginBottom: 20,
-            lineHeight: 1.5,
-          }}
-        >
-          {message}
-        </p>
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={onCancel}>
+      <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 12, padding: 24, maxWidth: 400, width: "90%" }} onClick={(e) => e.stopPropagation()}>
+        <p style={{ color: COLORS.text, fontSize: 14, marginBottom: 20, lineHeight: 1.5 }}>{message}</p>
         <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-          <button
-            onClick={onCancel}
-            style={{
-              ...BTN,
-              background: "transparent",
-              border: `1px solid ${COLORS.border}`,
-              color: COLORS.text,
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            style={{ ...BTN, background: COLORS.red, color: "#fff" }}
-          >
-            Confirm
-          </button>
+          <button onClick={onCancel} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.border}`, color: COLORS.text }}>Cancel</button>
+          <button onClick={onConfirm} style={{ ...BTN, background: COLORS.red, color: "#fff" }}>Confirm</button>
         </div>
       </div>
     </div>
@@ -552,81 +526,17 @@ function ConfirmDialog({ message, onConfirm, onCancel }) {
 function SendWarningDialog({ onConfirm, onCancel }) {
   const [skip, setSkip] = useState(false);
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.6)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 1000,
-      }}
-      onClick={onCancel}
-    >
-      <div
-        style={{
-          background: COLORS.card,
-          border: `1px solid ${COLORS.border}`,
-          borderRadius: 12,
-          padding: 24,
-          maxWidth: 420,
-          width: "90%",
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3
-          style={{ color: COLORS.text, fontSize: 16, marginBottom: 12 }}
-        >
-          Send transcript to Claude?
-        </h3>
-        <p
-          style={{
-            color: COLORS.muted,
-            fontSize: 13,
-            lineHeight: 1.6,
-            marginBottom: 16,
-          }}
-        >
-          This will send your full transcript to Anthropic&apos;s API for
-          summarization. The data goes directly to Anthropic — nowhere else.
-        </p>
-        <label
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            color: COLORS.muted,
-            fontSize: 12,
-            marginBottom: 20,
-            cursor: "pointer",
-          }}
-        >
-          <input
-            type="checkbox"
-            checked={skip}
-            onChange={(e) => setSkip(e.target.checked)}
-          />
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={onCancel}>
+      <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 12, padding: 24, maxWidth: 420, width: "90%" }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ color: COLORS.text, fontSize: 16, marginBottom: 12 }}>Send data to Claude?</h3>
+        <p style={{ color: COLORS.muted, fontSize: 13, lineHeight: 1.6, marginBottom: 16 }}>This will send your transcript to Anthropic&apos;s API. The data goes directly to Anthropic — nowhere else.</p>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, color: COLORS.muted, fontSize: 12, marginBottom: 20, cursor: "pointer" }}>
+          <input type="checkbox" checked={skip} onChange={(e) => setSkip(e.target.checked)} />
           Don&apos;t ask again
         </label>
         <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-          <button
-            onClick={onCancel}
-            style={{
-              ...BTN,
-              background: "transparent",
-              border: `1px solid ${COLORS.border}`,
-              color: COLORS.text,
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => onConfirm(skip)}
-            style={{ ...BTN, background: COLORS.accent, color: "#fff" }}
-          >
-            Send to Claude
-          </button>
+          <button onClick={onCancel} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.border}`, color: COLORS.text }}>Cancel</button>
+          <button onClick={() => onConfirm(skip)} style={{ ...BTN, background: COLORS.accent, color: "#fff" }}>Send to Claude</button>
         </div>
       </div>
     </div>
@@ -635,34 +545,12 @@ function SendWarningDialog({ onConfirm, onCancel }) {
 
 function SentimentChip({ sentiment }) {
   if (!sentiment) return null;
-  const map = {
-    positive: COLORS.green,
-    neutral: COLORS.blue,
-    tense: COLORS.red,
-    mixed: COLORS.yellow,
-  };
+  const map = { positive: COLORS.green, neutral: COLORS.blue, tense: COLORS.red, mixed: COLORS.yellow };
   const c = map[sentiment.tag] || COLORS.muted;
   return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 6,
-        padding: "4px 10px",
-        borderRadius: 20,
-        background: c + "22",
-        color: c,
-        fontSize: 12,
-        fontWeight: 600,
-      }}
-    >
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 20, background: c + "22", color: c, fontSize: 12, fontWeight: 600 }}>
       {sentiment.tag.toUpperCase()}
-      {sentiment.rationale && (
-        <span style={{ fontWeight: 400, opacity: 0.8 }}>
-          {" "}
-          — {sentiment.rationale}
-        </span>
-      )}
+      {sentiment.rationale && <span style={{ fontWeight: 400, opacity: 0.8 }}> — {sentiment.rationale}</span>}
     </span>
   );
 }
@@ -670,18 +558,7 @@ function SentimentChip({ sentiment }) {
 function SumSec({ title, children }) {
   return (
     <div style={{ marginBottom: 16 }}>
-      <h4
-        style={{
-          color: COLORS.accent,
-          fontSize: 11,
-          textTransform: "uppercase",
-          letterSpacing: 1.2,
-          marginBottom: 6,
-          fontWeight: 700,
-        }}
-      >
-        {title}
-      </h4>
+      <h4 style={{ color: COLORS.accent, fontSize: 11, textTransform: "uppercase", letterSpacing: 1.2, marginBottom: 6, fontWeight: 700 }}>{title}</h4>
       {children}
     </div>
   );
@@ -689,170 +566,130 @@ function SumSec({ title, children }) {
 
 function SummaryView({ summary, onCopyMd, onDownloadMd }) {
   if (!summary) return null;
-
-  const listStyle = {
-    color: COLORS.text,
-    fontSize: 13,
-    lineHeight: 1.8,
-    paddingLeft: 18,
-    margin: 0,
-  };
-
+  const ls = { color: COLORS.text, fontSize: 13, lineHeight: 1.8, paddingLeft: 18, margin: 0 };
   return (
-    <div
-      style={{
-        background: COLORS.surface,
-        border: `1px solid ${COLORS.border}`,
-        borderRadius: 10,
-        padding: 20,
-      }}
-    >
-      {summary.tldr && (
-        <SumSec title="TL;DR">
-          <p style={{ color: COLORS.text, fontSize: 14, lineHeight: 1.6 }}>
-            {summary.tldr}
-          </p>
-        </SumSec>
-      )}
-
+    <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 10, padding: 20 }}>
+      {summary.tldr && <SumSec title="TL;DR"><p style={{ color: COLORS.text, fontSize: 14, lineHeight: 1.6 }}>{summary.tldr}</p></SumSec>}
       {summary.topics?.length > 0 && (
         <SumSec title="Topics">
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-            {summary.topics.map((t, i) => (
-              <span
-                key={i}
-                style={{
-                  padding: "3px 10px",
-                  borderRadius: 20,
-                  background: COLORS.accent + "22",
-                  color: COLORS.accent,
-                  fontSize: 12,
-                  fontWeight: 500,
-                }}
-              >
-                {t}
-              </span>
-            ))}
+            {summary.topics.map((t, i) => <span key={i} style={{ padding: "3px 10px", borderRadius: 20, background: COLORS.accent + "22", color: COLORS.accent, fontSize: 12, fontWeight: 500 }}>{t}</span>)}
           </div>
         </SumSec>
       )}
-
-      {summary.keyPoints?.length > 0 && (
-        <SumSec title="Key Points">
-          <ul style={listStyle}>
-            {summary.keyPoints.map((p, i) => (
-              <li key={i}>{p}</li>
-            ))}
-          </ul>
-        </SumSec>
-      )}
-
+      {summary.keyPoints?.length > 0 && <SumSec title="Key Points"><ul style={ls}>{summary.keyPoints.map((p, i) => <li key={i}>{p}</li>)}</ul></SumSec>}
       {summary.actionItems?.length > 0 && (
         <SumSec title="Action Items">
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {summary.actionItems.map((a, i) => (
-              <div
-                key={i}
-                style={{
-                  display: "flex",
-                  gap: 8,
-                  alignItems: "baseline",
-                  fontSize: 13,
-                  color: COLORS.text,
-                }}
-              >
-                <span style={{ color: COLORS.accent, flexShrink: 0 }}>
-                  ▸
-                </span>
+              <div key={i} style={{ display: "flex", gap: 8, alignItems: "baseline", fontSize: 13, color: COLORS.text }}>
+                <span style={{ color: COLORS.accent, flexShrink: 0 }}>▸</span>
                 <span>{a.task}</span>
-                {a.owner && a.owner !== "unassigned" && (
-                  <span
-                    style={{
-                      color: COLORS.blue,
-                      fontSize: 11,
-                      flexShrink: 0,
-                    }}
-                  >
-                    @{a.owner}
-                  </span>
-                )}
-                {a.due && (
-                  <span
-                    style={{
-                      color: COLORS.muted,
-                      fontSize: 11,
-                      flexShrink: 0,
-                    }}
-                  >
-                    due {a.due}
-                  </span>
-                )}
+                {a.owner && a.owner !== "unassigned" && <span style={{ color: COLORS.blue, fontSize: 11, flexShrink: 0 }}>@{a.owner}</span>}
+                {a.due && <span style={{ color: COLORS.muted, fontSize: 11, flexShrink: 0 }}>due {a.due}</span>}
               </div>
             ))}
           </div>
         </SumSec>
       )}
+      {summary.decisions?.length > 0 && <SumSec title="Decisions"><ul style={ls}>{summary.decisions.map((d, i) => <li key={i}>{d}</li>)}</ul></SumSec>}
+      {summary.openQuestions?.length > 0 && <SumSec title="Open Questions"><ul style={{ ...ls, color: COLORS.yellow }}>{summary.openQuestions.map((q, i) => <li key={i}>{q}</li>)}</ul></SumSec>}
+      {summary.sentiment && <SumSec title="Sentiment"><SentimentChip sentiment={summary.sentiment} /></SumSec>}
+      <div style={{ display: "flex", gap: 8, marginTop: 12, paddingTop: 12, borderTop: `1px solid ${COLORS.border}` }}>
+        <button onClick={onCopyMd} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 12 }}>Copy as Markdown</button>
+        <button onClick={onDownloadMd} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 12 }}>Download .md</button>
+      </div>
+    </div>
+  );
+}
 
-      {summary.decisions?.length > 0 && (
-        <SumSec title="Decisions">
-          <ul style={listStyle}>
-            {summary.decisions.map((d, i) => (
-              <li key={i}>{d}</li>
-            ))}
-          </ul>
-        </SumSec>
+function SegmentRow({ segment, name, searchQ, onHighlight }) {
+  const col = speakerColor(segment.speaker);
+  let parts = [segment.text];
+  if (searchQ) {
+    try {
+      parts = segment.text.split(new RegExp(`(${escapeRegex(searchQ)})`, "gi"));
+    } catch { /* fallthrough */ }
+  }
+  return (
+    <div style={{ display: "flex", gap: 10, padding: "6px 0", borderLeft: segment.highlight ? `3px solid ${COLORS.accent}` : "3px solid transparent", paddingLeft: 8 }}>
+      <div style={{ flexShrink: 0, width: 44, fontSize: 11, color: COLORS.muted, fontVariantNumeric: "tabular-nums", paddingTop: 2 }}>{fmtTs(segment.ts)}</div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <span style={{ fontSize: 11, fontWeight: 600, color: col }}>{name || `Speaker ${segment.speaker}`}</span>
+        <div style={{ fontSize: 14, color: COLORS.text, lineHeight: 1.6, marginTop: 1 }}>
+          {parts.map((p, i) =>
+            searchQ && p.toLowerCase() === searchQ.toLowerCase()
+              ? <mark key={i} style={{ background: COLORS.accent + "44", color: COLORS.text, borderRadius: 2, padding: "0 2px" }}>{p}</mark>
+              : <span key={i}>{p}</span>
+          )}
+        </div>
+      </div>
+      <button onClick={() => onHighlight(segment.id)} style={{ ...BTN, background: "transparent", border: "none", color: segment.highlight ? COLORS.accent : COLORS.dim, fontSize: 16, padding: "2px 4px", flexShrink: 0, cursor: "pointer", lineHeight: 1 }} title="Bookmark">
+        {segment.highlight ? "★" : "☆"}
+      </button>
+    </div>
+  );
+}
+
+function LiveNotesPanel({ notes }) {
+  if (!notes || notes.length === 0) return <p style={{ color: COLORS.muted, fontSize: 13 }}>AI notes will appear here during recording.</p>;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      {notes.map((n, i) => (
+        <div key={i}>
+          <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 4 }}>{fmtTs(n.ts)}</div>
+          {n.keyPoints?.length > 0 && n.keyPoints.map((p, j) => <div key={`p${j}`} style={{ fontSize: 13, color: COLORS.text, paddingLeft: 8, borderLeft: `2px solid ${COLORS.accent}`, marginBottom: 4 }}>{p}</div>)}
+          {n.actionItems?.length > 0 && n.actionItems.map((a, j) => <div key={`a${j}`} style={{ fontSize: 13, color: COLORS.green, paddingLeft: 8, borderLeft: `2px solid ${COLORS.green}`, marginBottom: 4 }}>Action: {a}</div>)}
+          {n.decisions?.length > 0 && n.decisions.map((d, j) => <div key={`d${j}`} style={{ fontSize: 13, color: COLORS.blue, paddingLeft: 8, borderLeft: `2px solid ${COLORS.blue}`, marginBottom: 4 }}>Decision: {d}</div>)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChatPanel({ messages, input, onInput, onSend, loading }) {
+  return (
+    <div>
+      {messages.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 12, maxHeight: 300, overflowY: "auto" }}>
+          {messages.map((m, i) => (
+            <div key={i}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: COLORS.accent, marginBottom: 2 }}>You</div>
+              <div style={{ fontSize: 13, color: COLORS.text, marginBottom: 8 }}>{m.q}</div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: COLORS.green, marginBottom: 2 }}>AI</div>
+              <div style={{ fontSize: 13, color: COLORS.text, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{m.a}</div>
+            </div>
+          ))}
+        </div>
       )}
-
-      {summary.openQuestions?.length > 0 && (
-        <SumSec title="Open Questions">
-          <ul style={{ ...listStyle, color: COLORS.yellow }}>
-            {summary.openQuestions.map((q, i) => (
-              <li key={i}>{q}</li>
-            ))}
-          </ul>
-        </SumSec>
-      )}
-
-      {summary.sentiment && (
-        <SumSec title="Sentiment">
-          <SentimentChip sentiment={summary.sentiment} />
-        </SumSec>
-      )}
-
-      <div
-        style={{
-          display: "flex",
-          gap: 8,
-          marginTop: 12,
-          paddingTop: 12,
-          borderTop: `1px solid ${COLORS.border}`,
-        }}
-      >
-        <button
-          onClick={onCopyMd}
-          style={{
-            ...BTN,
-            background: "transparent",
-            border: `1px solid ${COLORS.border}`,
-            color: COLORS.text,
-            fontSize: 12,
-          }}
-        >
-          Copy as Markdown
-        </button>
-        <button
-          onClick={onDownloadMd}
-          style={{
-            ...BTN,
-            background: "transparent",
-            border: `1px solid ${COLORS.border}`,
-            color: COLORS.text,
-            fontSize: 12,
-          }}
-        >
-          Download .md
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={input}
+          onChange={(e) => onInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && onSend()}
+          placeholder="Ask about this meeting…"
+          style={{ flex: 1, background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: "8px 12px", color: COLORS.text, fontSize: 13, outline: "none" }}
+        />
+        <button onClick={onSend} disabled={loading || !input.trim()} style={{ ...BTN, background: COLORS.accent, color: "#fff", opacity: loading || !input.trim() ? 0.5 : 1, cursor: loading || !input.trim() ? "not-allowed" : "pointer", display: "inline-flex", alignItems: "center", gap: 6, minHeight: 38 }}>
+          {loading ? <Spinner size={14} /> : "Ask"}
         </button>
       </div>
+    </div>
+  );
+}
+
+// ─── Collapsible section ────────────────────────────────────
+
+function Section({ title, badge, defaultOpen, children }) {
+  const [open, setOpen] = useState(defaultOpen ?? false);
+  return (
+    <div style={{ marginTop: 20 }}>
+      <button onClick={() => setOpen(!open)} style={{ ...BTN, background: "transparent", border: "none", color: COLORS.text, padding: 0, display: "flex", alignItems: "center", gap: 8, fontSize: 14, fontWeight: 600 }}>
+        <span style={{ color: COLORS.dim, fontSize: 12 }}>{open ? "▾" : "▸"}</span>
+        {title}
+        {badge != null && <span style={{ fontSize: 11, color: COLORS.muted, fontWeight: 400 }}>({badge})</span>}
+      </button>
+      {open && <div style={{ marginTop: 10 }}>{children}</div>}
     </div>
   );
 }
@@ -860,101 +697,150 @@ function SummaryView({ summary, onCopyMd, onDownloadMd }) {
 // ─── Main Component ─────────────────────────────────────────
 
 export default function MeetingListener() {
-  // API key
-  const [apiKey, setApiKey] = useState(
-    () => localStorage.getItem(KEYS.apiKey) || ""
-  );
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem(KEYS.apiKey) || "");
   const [showKey, setShowKey] = useState(false);
 
-  // Meetings
-  const mtg = useMeetings();
-  const {
-    meetings,
-    current,
-    currentId,
-    create,
-    update,
-    remove,
-    load,
-    clearAll,
-    exportAll,
-  } = mtg;
+  const { meetings, current, currentId, create, update, remove, load, clearAll, exportAll } = useMeetings();
 
-  // Editor state
-  const [transcript, setTranscript] = useState(current?.transcript || "");
+  // Segment-based transcript
+  const [segments, setSegments] = useState([]);
   const [interimText, setInterimText] = useState("");
-  const [sumData, setSumData] = useState(current?.summary || null);
+  const [speakerNames, setSpeakerNames] = useState({});
+  const currentSpeakerRef = useRef(1);
+  const lastSpeechTimeRef = useRef(null);
+  const segmentsRef = useRef([]);
+  useEffect(() => { segmentsRef.current = segments; }, [segments]);
+
+  // Summary
+  const [sumData, setSumData] = useState(null);
   const [focusInstr, setFocusInstr] = useState("");
   const [summarizing, setSummarizing] = useState(false);
   const [sumError, setSumError] = useState("");
 
-  // Recording timer
-  const accumulated = useRef(current?.durationMs || 0);
+  // Live notes
+  const [liveNotes, setLiveNotes] = useState([]);
+  const [liveNotesOn, setLiveNotesOn] = useState(true);
+  const lastNotesIdx = useRef(0);
+
+  // AI Chat
+  const [chatMsgs, setChatMsgs] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+
+  // Search
+  const [searchQ, setSearchQ] = useState("");
+
+  // Polish
+  const [polishing, setPolishing] = useState(false);
+  const [polishedText, setPolishedText] = useState(null);
+  const [showPolished, setShowPolished] = useState(false);
+
+  // Timer
+  const accumulated = useRef(0);
   const sessionStart = useRef(null);
-  const [elapsed, setElapsed] = useState(current?.durationMs || 0);
+  const [elapsed, setElapsed] = useState(0);
 
   // Privacy
   const [dataSent, setDataSent] = useState(false);
   const [showSendDlg, setShowSendDlg] = useState(false);
   const skipWarn = useRef(localStorage.getItem(KEYS.skipWarn) === "true");
   const sentSession = useRef(false);
+  const pendingCb = useRef(null);
 
   // UI
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.innerWidth < 640
-  );
+  const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.innerWidth < 640);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [toasts, setToasts] = useState([]);
   const [confirmState, setConfirmState] = useState(null);
   const [recError, setRecError] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [editingSpeakers, setEditingSpeakers] = useState(false);
 
-  // Refs
   const paneRef = useRef(null);
   const nearBottom = useRef(true);
   const autoTitled = useRef(new Set());
 
-  // ─── Toast helper ──────────────────────────────────────
+  // ─── Toast ─────────────────────────────────────────────
 
   const toast = useCallback((message, type = "info") => {
     const id = Date.now() + Math.random();
-    setToasts((prev) => [...prev, { id, message, type }]);
-    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 3000);
+    setToasts((p) => [...p, { id, message, type }]);
+    setTimeout(() => setToasts((p) => p.filter((t) => t.id !== id)), 3000);
   }, []);
+
+  // ─── Privacy gate ──────────────────────────────────────
+
+  function checkPrivacy(cb) {
+    if (!apiKey.trim()) { toast("Enter your API key first", "error"); return; }
+    if (!sentSession.current && !skipWarn.current) {
+      pendingCb.current = cb;
+      setShowSendDlg(true);
+      return;
+    }
+    sentSession.current = true;
+    setDataSent(true);
+    cb();
+  }
+
+  function confirmSend(dontAskAgain) {
+    setShowSendDlg(false);
+    sentSession.current = true;
+    setDataSent(true);
+    if (dontAskAgain) {
+      skipWarn.current = true;
+      localStorage.setItem(KEYS.skipWarn, "true");
+    }
+    pendingCb.current?.();
+    pendingCb.current = null;
+  }
 
   // ─── Speech recognition ────────────────────────────────
 
   const handleFinal = useCallback((text) => {
-    setTranscript((prev) => prev + text);
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const now = accumulated.current + (sessionStart.current ? Date.now() - sessionStart.current : 0);
+    let spk = currentSpeakerRef.current;
+    if (lastSpeechTimeRef.current !== null && now - lastSpeechTimeRef.current > 3000) {
+      spk = currentSpeakerRef.current + 1;
+      currentSpeakerRef.current = spk;
+    }
+    lastSpeechTimeRef.current = now;
+    const seg = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+      text: trimmed,
+      ts: now,
+      speaker: spk,
+      highlight: false,
+    };
+    setSegments((prev) => [...prev, seg]);
     setInterimText("");
   }, []);
 
-  const handleInterim = useCallback((text) => {
-    setInterimText(text);
-  }, []);
-
-  const handleRecErr = useCallback(
-    (msg) => {
-      setRecError(msg);
-      toast(msg, "error");
-    },
-    [toast]
-  );
+  const handleInterim = useCallback((text) => setInterimText(text), []);
+  const handleRecErr = useCallback((msg) => { setRecError(msg); toast(msg, "error"); }, [toast]);
 
   const speech = useSpeechRecognition(handleFinal, handleInterim, handleRecErr);
   const { supported, recording, paused } = speech;
 
-  // ─── Load meeting on switch ────────────────────────────
+  // ─── Load meeting ──────────────────────────────────────
 
   useEffect(() => {
     if (current) {
-      setTranscript(current.transcript || "");
+      setSegments(current.segments || []);
       setSumData(current.summary || null);
+      setSpeakerNames(current.speakerNames || {});
+      setLiveNotes(current.liveNotes || []);
+      setChatMsgs(current.chatHistory || []);
       accumulated.current = current.durationMs || 0;
       setElapsed(current.durationMs || 0);
+      lastNotesIdx.current = current.segments?.length || 0;
     } else {
-      setTranscript("");
+      setSegments([]);
       setSumData(null);
+      setSpeakerNames({});
+      setLiveNotes([]);
+      setChatMsgs([]);
       accumulated.current = 0;
       setElapsed(0);
     }
@@ -962,58 +848,55 @@ export default function MeetingListener() {
     setSumError("");
     setInterimText("");
     setRecError("");
+    setSearchQ("");
+    setChatInput("");
+    setPolishedText(null);
+    setShowPolished(false);
+    currentSpeakerRef.current = 1;
+    lastSpeechTimeRef.current = null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentId]);
 
-  // ─── Timer tick ────────────────────────────────────────
+  // ─── Timer ─────────────────────────────────────────────
 
   useEffect(() => {
     if (!recording || paused) return;
     const id = setInterval(() => {
-      if (sessionStart.current) {
-        setElapsed(
-          accumulated.current + (Date.now() - sessionStart.current)
-        );
-      }
+      if (sessionStart.current) setElapsed(accumulated.current + (Date.now() - sessionStart.current));
     }, 200);
     return () => clearInterval(id);
   }, [recording, paused]);
 
-  // ─── Auto-save transcript ──────────────────────────────
+  // ─── Auto-save ─────────────────────────────────────────
 
   useEffect(() => {
-    if (!currentId || !transcript) return;
+    if (!currentId || segments.length === 0) return;
     const t = setTimeout(() => {
-      const dur =
-        accumulated.current +
-        (sessionStart.current ? Date.now() - sessionStart.current : 0);
-      const ok = update(currentId, { transcript, durationMs: dur });
+      const dur = accumulated.current + (sessionStart.current ? Date.now() - sessionStart.current : 0);
+      const ok = update(currentId, { segments, speakerNames, liveNotes, chatHistory: chatMsgs, durationMs: dur });
       if (!ok) toast("Storage full — export or delete older meetings", "error");
     }, 1000);
     return () => clearTimeout(t);
-  }, [transcript, currentId, update, toast]);
+  }, [segments, speakerNames, liveNotes, chatMsgs, currentId, update, toast]);
 
-  // ─── Auto-title from first words ───────────────────────
+  // ─── Auto-title ────────────────────────────────────────
 
   useEffect(() => {
-    if (!currentId || !transcript.trim()) return;
+    if (!currentId || segments.length === 0) return;
     if (autoTitled.current.has(currentId)) return;
     const m = meetings.find((x) => x.id === currentId);
     if (!m || m.title !== "Untitled Meeting") return;
     autoTitled.current.add(currentId);
-    const words = transcript.trim().split(/\s+/).slice(0, 6).join(" ");
-    update(currentId, {
-      title: words + (transcript.trim().split(/\s+/).length > 6 ? "…" : ""),
-    });
-  }, [transcript, currentId, meetings, update]);
+    const text = segsToText(segments);
+    const words = text.trim().split(/\s+/).slice(0, 6).join(" ");
+    update(currentId, { title: words + (text.trim().split(/\s+/).length > 6 ? "…" : "") });
+  }, [segments, currentId, meetings, update]);
 
-  // ─── Auto-scroll transcript pane ───────────────────────
+  // ─── Auto-scroll ───────────────────────────────────────
 
   useEffect(() => {
-    if (nearBottom.current && paneRef.current) {
-      paneRef.current.scrollTop = paneRef.current.scrollHeight;
-    }
-  }, [transcript, interimText]);
+    if (nearBottom.current && paneRef.current) paneRef.current.scrollTop = paneRef.current.scrollHeight;
+  }, [segments, interimText]);
 
   // ─── Responsive ────────────────────────────────────────
 
@@ -1023,13 +906,32 @@ export default function MeetingListener() {
     return () => window.removeEventListener("resize", h);
   }, []);
 
+  // ─── Live notes extraction ─────────────────────────────
+
+  useEffect(() => {
+    if (!recording || !liveNotesOn || !apiKey) return;
+    const id = setInterval(() => {
+      const segs = segmentsRef.current;
+      const newSegs = segs.slice(lastNotesIdx.current);
+      if (newSegs.length < 3) return;
+      const text = segsToText(newSegs);
+      if (text.length < 100) return;
+      lastNotesIdx.current = segs.length;
+      const ts = accumulated.current + (sessionStart.current ? Date.now() - sessionStart.current : 0);
+      extractLiveNotes(text, apiKey)
+        .then((notes) => {
+          const hasContent = notes.keyPoints?.length || notes.actionItems?.length || notes.decisions?.length;
+          if (hasContent) setLiveNotes((prev) => [...prev, { ts, ...notes }]);
+        })
+        .catch(() => { /* silent */ });
+    }, 30000);
+    return () => clearInterval(id);
+  }, [recording, liveNotesOn, apiKey]);
+
   // ─── Keyboard shortcuts ────────────────────────────────
 
   const stateRef = useRef({});
-  useEffect(() => {
-    stateRef.current = { recording, paused, currentId, transcript, apiKey };
-  });
-
+  useEffect(() => { stateRef.current = { recording, paused, currentId, segments, apiKey }; });
   const fnRef = useRef({});
 
   useEffect(() => {
@@ -1038,24 +940,12 @@ export default function MeetingListener() {
       const isInput = tag === "INPUT" || tag === "TEXTAREA";
       const s = stateRef.current;
       const fn = fnRef.current;
-
       if (e.key === " " && !isInput && s.currentId) {
         e.preventDefault();
-        if (s.recording) {
-          s.paused ? fn.handleResume?.() : fn.handlePause?.();
-        } else {
-          fn.handleStart?.();
-        }
+        s.recording ? (s.paused ? fn.handleResume?.() : fn.handlePause?.()) : fn.handleStart?.();
       }
-
-      if ((e.metaKey || e.ctrlKey) && e.key === "s") {
-        e.preventDefault();
-        fn.handleSummarize?.();
-      }
-
-      if (e.key === "Escape" && s.recording) {
-        fn.handleStop?.();
-      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); fn.handleSummarize?.(); }
+      if (e.key === "Escape" && s.recording) fn.handleStop?.();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -1064,77 +954,47 @@ export default function MeetingListener() {
   // ─── Recording handlers ────────────────────────────────
 
   function handleStart() {
-    if (!currentId) {
-      toast("Create a meeting first", "error");
-      return;
-    }
+    if (!currentId) { toast("Create a meeting first", "error"); return; }
     setRecError("");
     sessionStart.current = Date.now();
+    currentSpeakerRef.current = segments.length > 0 ? Math.max(...segments.map((s) => s.speaker)) : 1;
+    lastSpeechTimeRef.current = null;
     speech.start();
   }
-
   function handlePause() {
-    if (sessionStart.current) {
-      accumulated.current += Date.now() - sessionStart.current;
-      sessionStart.current = null;
-    }
+    if (sessionStart.current) { accumulated.current += Date.now() - sessionStart.current; sessionStart.current = null; }
     speech.pause();
   }
-
   function handleResume() {
     setRecError("");
     sessionStart.current = Date.now();
     speech.resume();
   }
-
   function handleStop() {
-    if (sessionStart.current) {
-      accumulated.current += Date.now() - sessionStart.current;
-      sessionStart.current = null;
-    }
+    if (sessionStart.current) { accumulated.current += Date.now() - sessionStart.current; sessionStart.current = null; }
     setElapsed(accumulated.current);
     speech.stop();
     setInterimText("");
-    if (currentId) {
-      update(currentId, { transcript, durationMs: accumulated.current });
-    }
+    if (currentId) update(currentId, { segments, durationMs: accumulated.current });
   }
 
-  // ─── Summarize handlers ────────────────────────────────
+  function handleHighlight(id) {
+    setSegments((prev) => prev.map((s) => (s.id === id ? { ...s, highlight: !s.highlight } : s)));
+  }
+
+  // ─── Summarize ─────────────────────────────────────────
 
   function handleSummarize() {
-    if (!apiKey.trim()) {
-      toast("Enter your API key first", "error");
-      return;
-    }
-    if (!transcript.trim()) {
-      toast("No transcript to summarize", "error");
-      return;
-    }
-    if (!sentSession.current && !skipWarn.current) {
-      setShowSendDlg(true);
-      return;
-    }
-    doSummarize();
+    const text = segsToLabeled(segments, speakerNames);
+    if (!text.trim()) { toast("No transcript to summarize", "error"); return; }
+    checkPrivacy(() => doSummarize(text));
   }
 
-  function confirmSend(dontAskAgain) {
-    setShowSendDlg(false);
-    sentSession.current = true;
-    if (dontAskAgain) {
-      skipWarn.current = true;
-      localStorage.setItem(KEYS.skipWarn, "true");
-    }
-    doSummarize();
-  }
-
-  async function doSummarize() {
+  async function doSummarize(text) {
     setSummarizing(true);
     setSumError("");
-    sentSession.current = true;
-    setDataSent(true);
     try {
-      const result = await summarize(transcript, apiKey, focusInstr);
+      const result = await summarizeMeeting(text, apiKey, focusInstr);
       setSumData(result);
       if (currentId) update(currentId, { summary: result });
       toast("Summary generated", "success");
@@ -1146,37 +1006,77 @@ export default function MeetingListener() {
     }
   }
 
+  // ─── Chat ──────────────────────────────────────────────
+
+  function handleChat() {
+    if (!chatInput.trim()) return;
+    const q = chatInput.trim();
+    const text = segsToLabeled(segments, speakerNames);
+    if (!text.trim()) { toast("No transcript to ask about", "error"); return; }
+    checkPrivacy(() => doChat(q, text));
+  }
+
+  async function doChat(q, text) {
+    setChatLoading(true);
+    setChatInput("");
+    try {
+      const a = await chatAboutMeeting(q, text, chatMsgs, apiKey);
+      setChatMsgs((prev) => [...prev, { q, a }]);
+    } catch (e) {
+      toast("Chat failed: " + e.message, "error");
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  // ─── Polish ────────────────────────────────────────────
+
+  function handlePolish() {
+    const text = segsToLabeled(segments, speakerNames);
+    if (!text.trim()) { toast("No transcript to polish", "error"); return; }
+    checkPrivacy(() => doPolish(text));
+  }
+
+  async function doPolish(text) {
+    setPolishing(true);
+    try {
+      const cleaned = await polishTranscript(text, apiKey);
+      setPolishedText(cleaned);
+      setShowPolished(true);
+      toast("Transcript polished", "success");
+    } catch (e) {
+      toast("Polish failed: " + e.message, "error");
+    } finally {
+      setPolishing(false);
+    }
+  }
+
   // ─── Transcript actions ────────────────────────────────
 
   async function handleCopy() {
-    if (await clipCopy(transcript)) toast("Transcript copied", "success");
+    const text = showPolished && polishedText ? polishedText : segsToLabeled(segments, speakerNames);
+    if (await clipCopy(text)) toast("Transcript copied", "success");
     else toast("Copy failed", "error");
   }
-
   function handleDownload() {
     const title = current?.title || "meeting";
-    downloadFile(
-      `${title.replace(/\s+/g, "-").toLowerCase()}-transcript.txt`,
-      transcript
-    );
+    const text = showPolished && polishedText ? polishedText : segsToLabeled(segments, speakerNames);
+    downloadFile(`${title.replace(/\s+/g, "-").toLowerCase()}-transcript.txt`, text);
     toast("Downloaded", "success");
   }
-
   function handleClear() {
     setConfirmState({
       message: "Clear the entire transcript? This cannot be undone.",
       onConfirm: () => {
-        setTranscript("");
+        setSegments([]);
         setInterimText("");
         setSumData(null);
+        setLiveNotes([]);
+        setChatMsgs([]);
+        setPolishedText(null);
         accumulated.current = 0;
         setElapsed(0);
-        if (currentId)
-          update(currentId, {
-            transcript: "",
-            summary: null,
-            durationMs: 0,
-          });
+        if (currentId) update(currentId, { segments: [], summary: null, liveNotes: [], chatHistory: [], durationMs: 0 });
         setConfirmState(null);
         toast("Transcript cleared", "success");
       },
@@ -1184,17 +1084,12 @@ export default function MeetingListener() {
   }
 
   async function handleCopyMd() {
-    if (await clipCopy(toMarkdown(sumData)))
-      toast("Summary copied as Markdown", "success");
+    if (await clipCopy(toMarkdown(sumData))) toast("Summary copied as Markdown", "success");
     else toast("Copy failed", "error");
   }
-
   function handleDownloadMd() {
     const title = current?.title || "meeting";
-    downloadFile(
-      `${title.replace(/\s+/g, "-").toLowerCase()}-summary.md`,
-      toMarkdown(sumData)
-    );
+    downloadFile(`${title.replace(/\s+/g, "-").toLowerCase()}-summary.md`, toMarkdown(sumData));
     toast("Downloaded", "success");
   }
 
@@ -1202,53 +1097,38 @@ export default function MeetingListener() {
 
   function handleNewMeeting() {
     if (recording) handleStop();
-    if (currentId && transcript) {
-      update(currentId, { transcript, durationMs: accumulated.current });
-    }
+    if (currentId && segments.length > 0) update(currentId, { segments, durationMs: accumulated.current });
     create();
   }
-
   function handleLoadMeeting(id) {
     if (recording) handleStop();
-    if (currentId && transcript) {
-      update(currentId, { transcript, durationMs: accumulated.current });
-    }
+    if (currentId && segments.length > 0) update(currentId, { segments, durationMs: accumulated.current });
     load(id);
     if (isMobile) setSidebarOpen(false);
   }
-
   function handleDeleteMeeting(id) {
     const m = meetings.find((x) => x.id === id);
     setConfirmState({
       message: `Delete "${m?.title || "meeting"}"? This cannot be undone.`,
-      onConfirm: () => {
-        remove(id);
-        setConfirmState(null);
-        toast("Meeting deleted", "success");
-      },
+      onConfirm: () => { remove(id); setConfirmState(null); toast("Meeting deleted", "success"); },
     });
   }
-
   function handleTitleChange(e) {
     if (currentId) update(currentId, { title: e.target.value });
   }
 
-  // ─── Settings actions ──────────────────────────────────
+  // ─── Settings ──────────────────────────────────────────
 
-  function handleClearKey() {
-    setApiKey("");
-    localStorage.removeItem(KEYS.apiKey);
-    toast("API key cleared", "success");
-  }
-
+  function handleClearKey() { setApiKey(""); localStorage.removeItem(KEYS.apiKey); toast("API key cleared", "success"); }
   function handleClearAll() {
     setConfirmState({
-      message:
-        "Delete ALL meetings? This permanently removes all saved data.",
+      message: "Delete ALL meetings? This permanently removes all saved data.",
       onConfirm: () => {
         clearAll();
-        setTranscript("");
+        setSegments([]);
         setSumData(null);
+        setLiveNotes([]);
+        setChatMsgs([]);
         accumulated.current = 0;
         setElapsed(0);
         setConfirmState(null);
@@ -1256,63 +1136,28 @@ export default function MeetingListener() {
       },
     });
   }
-
   function handleApiKeyBlur() {
     if (apiKey.trim()) localStorage.setItem(KEYS.apiKey, apiKey);
     else localStorage.removeItem(KEYS.apiKey);
   }
-
   function handlePaneScroll() {
     const el = paneRef.current;
-    if (!el) return;
-    nearBottom.current =
-      el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+    if (el) nearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
   }
 
   useEffect(() => {
     fnRef.current = { handleStart, handlePause, handleResume, handleStop, handleSummarize };
   });
 
-  // ─── Render: unsupported browser ───────────────────────
+  // ─── Render: unsupported ───────────────────────────────
 
   if (!supported) {
     return (
-      <div
-        style={{
-          minHeight: "100vh",
-          background: COLORS.bg,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: 20,
-          fontFamily:
-            "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-        }}
-      >
-        <div
-          style={{
-            background: COLORS.card,
-            border: `1px solid ${COLORS.border}`,
-            borderRadius: 12,
-            padding: 32,
-            maxWidth: 420,
-            textAlign: "center",
-          }}
-        >
+      <div style={{ minHeight: "100vh", background: COLORS.bg, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}>
+        <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 12, padding: 32, maxWidth: 420, textAlign: "center" }}>
           <div style={{ fontSize: 40, marginBottom: 16 }}>🎙</div>
-          <h2
-            style={{ color: COLORS.text, fontSize: 18, marginBottom: 12 }}
-          >
-            Browser Not Supported
-          </h2>
-          <p
-            style={{ color: COLORS.muted, fontSize: 14, lineHeight: 1.6 }}
-          >
-            Meeting Listener requires the Web Speech API, which is available
-            in{" "}
-            <strong style={{ color: COLORS.text }}>Chrome</strong> or{" "}
-            <strong style={{ color: COLORS.text }}>Edge</strong> on desktop.
-          </p>
+          <h2 style={{ color: COLORS.text, fontSize: 18, marginBottom: 12 }}>Browser Not Supported</h2>
+          <p style={{ color: COLORS.muted, fontSize: 14, lineHeight: 1.6 }}>Meeting Listener requires the Web Speech API, available in <strong style={{ color: COLORS.text }}>Chrome</strong> or <strong style={{ color: COLORS.text }}>Edge</strong> on desktop.</p>
         </div>
       </div>
     );
@@ -1320,398 +1165,71 @@ export default function MeetingListener() {
 
   // ─── Render ────────────────────────────────────────────
 
-  const words = wc(transcript);
+  const words = wc(segsToText(segments));
   const showSidebar = !isMobile || sidebarOpen;
+  const filteredSegs = searchQ
+    ? segments.filter((s) => s.text.toLowerCase().includes(searchQ.toLowerCase()))
+    : segments;
+  const uniqueSpeakers = [...new Set(segments.map((s) => s.speaker))].sort();
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: COLORS.bg,
-        color: COLORS.text,
-        fontFamily:
-          "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-      }}
-    >
-      <style>
-        {`@keyframes mlspin{to{transform:rotate(360deg)}}@keyframes mlpulse{0%,100%{opacity:1}50%{opacity:.3}}`}
-      </style>
+    <div style={{ minHeight: "100vh", background: COLORS.bg, color: COLORS.text, fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}>
+      <style>{`@keyframes mlspin{to{transform:rotate(360deg)}}@keyframes mlpulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
 
       {/* Toasts */}
-      <div
-        style={{
-          position: "fixed",
-          top: 16,
-          right: 16,
-          zIndex: 2000,
-          display: "flex",
-          flexDirection: "column",
-          gap: 8,
-        }}
-      >
-        {toasts.map((t) => (
-          <Toast key={t.id} message={t.message} type={t.type} />
-        ))}
+      <div style={{ position: "fixed", top: 16, right: 16, zIndex: 2000, display: "flex", flexDirection: "column", gap: 8 }}>
+        {toasts.map((t) => <Toast key={t.id} message={t.message} type={t.type} />)}
       </div>
 
-      {/* Confirm dialog */}
-      {confirmState && (
-        <ConfirmDialog
-          message={confirmState.message}
-          onConfirm={confirmState.onConfirm}
-          onCancel={() => setConfirmState(null)}
-        />
-      )}
-
-      {/* Send warning dialog */}
-      {showSendDlg && (
-        <SendWarningDialog
-          onConfirm={confirmSend}
-          onCancel={() => setShowSendDlg(false)}
-        />
-      )}
+      {confirmState && <ConfirmDialog message={confirmState.message} onConfirm={confirmState.onConfirm} onCancel={() => setConfirmState(null)} />}
+      {showSendDlg && <SendWarningDialog onConfirm={confirmSend} onCancel={() => { setShowSendDlg(false); pendingCb.current = null; }} />}
 
       {/* Header */}
-      <header
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 12,
-          padding: "12px 16px",
-          borderBottom: `1px solid ${COLORS.border}`,
-          background: COLORS.surface,
-          flexWrap: "wrap",
-        }}
-      >
+      <header style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 16px", borderBottom: `1px solid ${COLORS.border}`, background: COLORS.surface, flexWrap: "wrap" }}>
         {isMobile && (
-          <button
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            style={{
-              ...BTN,
-              background: "transparent",
-              color: COLORS.text,
-              padding: "6px 10px",
-              fontSize: 18,
-              border: "none",
-            }}
-          >
-            ☰
-          </button>
+          <button onClick={() => setSidebarOpen(!sidebarOpen)} style={{ ...BTN, background: "transparent", color: COLORS.text, padding: "6px 10px", fontSize: 18, border: "none" }}>☰</button>
         )}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            minWidth: 0,
-          }}
-        >
+        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
           <span style={{ color: COLORS.accent, fontSize: 18 }}>●</span>
-          <span
-            style={{
-              fontSize: 15,
-              fontWeight: 700,
-              color: COLORS.text,
-              whiteSpace: "nowrap",
-            }}
-          >
-            Meeting Listener
-          </span>
+          <span style={{ fontSize: 15, fontWeight: 700, color: COLORS.text, whiteSpace: "nowrap" }}>Meeting Listener</span>
         </div>
-
-        <span
-          style={{
-            padding: "3px 10px",
-            borderRadius: 20,
-            fontSize: 11,
-            fontWeight: 600,
-            background: dataSent
-              ? COLORS.yellow + "22"
-              : COLORS.green + "22",
-            color: dataSent ? COLORS.yellow : COLORS.green,
-            whiteSpace: "nowrap",
-          }}
-        >
+        <span style={{ padding: "3px 10px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: dataSent ? COLORS.yellow + "22" : COLORS.green + "22", color: dataSent ? COLORS.yellow : COLORS.green, whiteSpace: "nowrap" }}>
           {dataSent ? "Sent to Anthropic API" : "Local only"}
         </span>
-
-        <div
-          style={{
-            marginLeft: "auto",
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-          }}
-        >
-          <input
-            type={showKey ? "text" : "password"}
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            onBlur={handleApiKeyBlur}
-            placeholder="Anthropic API Key"
-            autoComplete="off"
-            style={{
-              background: COLORS.card,
-              border: `1px solid ${COLORS.border}`,
-              borderRadius: 6,
-              padding: "6px 10px",
-              color: COLORS.text,
-              fontSize: 12,
-              width: isMobile ? 140 : 220,
-              outline: "none",
-            }}
-          />
-          <button
-            onClick={() => setShowKey(!showKey)}
-            style={{
-              ...BTN,
-              background: "transparent",
-              border: "none",
-              color: COLORS.muted,
-              padding: "4px 6px",
-              fontSize: 13,
-            }}
-            title={showKey ? "Hide API key" : "Show API key"}
-          >
-            {showKey ? "◉" : "○"}
-          </button>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
+          <input type={showKey ? "text" : "password"} value={apiKey} onChange={(e) => setApiKey(e.target.value)} onBlur={handleApiKeyBlur} placeholder="Anthropic API Key" autoComplete="off" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: "6px 10px", color: COLORS.text, fontSize: 12, width: isMobile ? 140 : 220, outline: "none" }} />
+          <button onClick={() => setShowKey(!showKey)} style={{ ...BTN, background: "transparent", border: "none", color: COLORS.muted, padding: "4px 6px", fontSize: 13 }} title={showKey ? "Hide" : "Show"}>{showKey ? "◉" : "○"}</button>
         </div>
       </header>
 
       {/* Main layout */}
-      <div
-        style={{
-          display: "flex",
-          minHeight: "calc(100vh - 53px)",
-          position: "relative",
-        }}
-      >
-        {/* Mobile sidebar backdrop */}
-        {isMobile && sidebarOpen && (
-          <div
-            onClick={() => setSidebarOpen(false)}
-            style={{
-              position: "fixed",
-              inset: 0,
-              background: "rgba(0,0,0,0.4)",
-              zIndex: 400,
-            }}
-          />
-        )}
+      <div style={{ display: "flex", minHeight: "calc(100vh - 53px)", position: "relative" }}>
+        {isMobile && sidebarOpen && <div onClick={() => setSidebarOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 400 }} />}
 
         {/* Sidebar */}
         {showSidebar && (
-          <aside
-            style={{
-              width: isMobile ? 280 : 240,
-              background: COLORS.surface,
-              borderRight: isMobile ? "none" : `1px solid ${COLORS.border}`,
-              padding: 12,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-              overflowY: "auto",
-              position: isMobile ? "absolute" : "relative",
-              top: 0,
-              left: 0,
-              bottom: 0,
-              zIndex: isMobile ? 500 : 1,
-            }}
-          >
-            <button
-              onClick={handleNewMeeting}
-              style={{
-                ...BTN,
-                background: COLORS.accent,
-                color: "#fff",
-                width: "100%",
-                padding: "10px 0",
-                minHeight: 44,
-              }}
-            >
-              + New Meeting
-            </button>
-
-            <div
-              style={{
-                flex: 1,
-                display: "flex",
-                flexDirection: "column",
-                gap: 4,
-                marginTop: 8,
-                overflowY: "auto",
-              }}
-            >
-              {meetings.length === 0 && (
-                <p
-                  style={{
-                    color: COLORS.muted,
-                    fontSize: 12,
-                    textAlign: "center",
-                    padding: 16,
-                  }}
-                >
-                  No meetings yet
-                </p>
-              )}
+          <aside style={{ width: isMobile ? 280 : 240, background: COLORS.surface, borderRight: isMobile ? "none" : `1px solid ${COLORS.border}`, padding: 12, display: "flex", flexDirection: "column", gap: 8, overflowY: "auto", position: isMobile ? "absolute" : "relative", top: 0, left: 0, bottom: 0, zIndex: isMobile ? 500 : 1 }}>
+            <button onClick={handleNewMeeting} style={{ ...BTN, background: COLORS.accent, color: "#fff", width: "100%", padding: "10px 0", minHeight: 44 }}>+ New Meeting</button>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4, marginTop: 8, overflowY: "auto" }}>
+              {meetings.length === 0 && <p style={{ color: COLORS.muted, fontSize: 12, textAlign: "center", padding: 16 }}>No meetings yet</p>}
               {meetings.map((m) => (
-                <div
-                  key={m.id}
-                  onClick={() => handleLoadMeeting(m.id)}
-                  style={{
-                    padding: "8px 10px",
-                    borderRadius: 6,
-                    cursor: "pointer",
-                    background:
-                      m.id === currentId ? COLORS.accentGlow : "transparent",
-                    border: `1px solid ${
-                      m.id === currentId ? COLORS.accent + "44" : "transparent"
-                    }`,
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    gap: 8,
-                    minHeight: 44,
-                  }}
-                >
+                <div key={m.id} onClick={() => handleLoadMeeting(m.id)} style={{ padding: "8px 10px", borderRadius: 6, cursor: "pointer", background: m.id === currentId ? COLORS.accentGlow : "transparent", border: `1px solid ${m.id === currentId ? COLORS.accent + "44" : "transparent"}`, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, minHeight: 44 }}>
                   <div style={{ minWidth: 0, flex: 1 }}>
-                    <div
-                      style={{
-                        fontSize: 13,
-                        fontWeight: 500,
-                        color: COLORS.text,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {m.title}
-                    </div>
-                    <div
-                      style={{
-                        fontSize: 11,
-                        color: COLORS.muted,
-                        marginTop: 2,
-                      }}
-                    >
-                      {new Date(m.createdAt).toLocaleDateString()} ·{" "}
-                      {wc(m.transcript)} words
-                    </div>
+                    <div style={{ fontSize: 13, fontWeight: 500, color: COLORS.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.title}</div>
+                    <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 2 }}>{new Date(m.createdAt).toLocaleDateString()} · {wc(segsToText(m.segments || []))} words</div>
                   </div>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleDeleteMeeting(m.id);
-                    }}
-                    style={{
-                      ...BTN,
-                      background: "transparent",
-                      border: "none",
-                      color: COLORS.muted,
-                      padding: "2px 6px",
-                      fontSize: 16,
-                      opacity: 0.5,
-                      minWidth: 24,
-                    }}
-                  >
-                    ×
-                  </button>
+                  <button onClick={(e) => { e.stopPropagation(); handleDeleteMeeting(m.id); }} style={{ ...BTN, background: "transparent", border: "none", color: COLORS.muted, padding: "2px 6px", fontSize: 16, opacity: 0.5, minWidth: 24 }}>×</button>
                 </div>
               ))}
             </div>
-
-            {/* Settings */}
-            <div
-              style={{
-                borderTop: `1px solid ${COLORS.border}`,
-                paddingTop: 8,
-                marginTop: 8,
-              }}
-            >
-              <button
-                onClick={() => setShowSettings(!showSettings)}
-                style={{
-                  ...BTN,
-                  background: "transparent",
-                  border: "none",
-                  color: COLORS.muted,
-                  fontSize: 12,
-                  padding: "4px 0",
-                  width: "100%",
-                  textAlign: "left",
-                }}
-              >
-                {showSettings ? "▾" : "▸"} Settings
-              </button>
+            <div style={{ borderTop: `1px solid ${COLORS.border}`, paddingTop: 8, marginTop: 8 }}>
+              <button onClick={() => setShowSettings(!showSettings)} style={{ ...BTN, background: "transparent", border: "none", color: COLORS.muted, fontSize: 12, padding: "4px 0", width: "100%", textAlign: "left" }}>{showSettings ? "▾" : "▸"} Settings</button>
               {showSettings && (
-                <div
-                  style={{
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 6,
-                    marginTop: 6,
-                  }}
-                >
-                  <button
-                    onClick={handleClearKey}
-                    style={{
-                      ...BTN,
-                      background: "transparent",
-                      border: `1px solid ${COLORS.border}`,
-                      color: COLORS.text,
-                      fontSize: 11,
-                      padding: "6px 8px",
-                      textAlign: "left",
-                    }}
-                  >
-                    Clear API Key
-                  </button>
-                  <button
-                    onClick={handleClearAll}
-                    style={{
-                      ...BTN,
-                      background: "transparent",
-                      border: `1px solid ${COLORS.red}33`,
-                      color: COLORS.red,
-                      fontSize: 11,
-                      padding: "6px 8px",
-                      textAlign: "left",
-                    }}
-                  >
-                    Clear All Meetings
-                  </button>
-                  <button
-                    onClick={exportAll}
-                    style={{
-                      ...BTN,
-                      background: "transparent",
-                      border: `1px solid ${COLORS.border}`,
-                      color: COLORS.text,
-                      fontSize: 11,
-                      padding: "6px 8px",
-                      textAlign: "left",
-                    }}
-                  >
-                    Export All as JSON
-                  </button>
-                  <button
-                    onClick={() => {
-                      skipWarn.current = false;
-                      localStorage.removeItem(KEYS.skipWarn);
-                      toast("Send warning re-enabled", "success");
-                    }}
-                    style={{
-                      ...BTN,
-                      background: "transparent",
-                      border: `1px solid ${COLORS.border}`,
-                      color: COLORS.text,
-                      fontSize: 11,
-                      padding: "6px 8px",
-                      textAlign: "left",
-                    }}
-                  >
-                    Reset Send Warning
-                  </button>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 6 }}>
+                  <button onClick={handleClearKey} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 11, padding: "6px 8px", textAlign: "left" }}>Clear API Key</button>
+                  <button onClick={handleClearAll} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.red}33`, color: COLORS.red, fontSize: 11, padding: "6px 8px", textAlign: "left" }}>Clear All Meetings</button>
+                  <button onClick={exportAll} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 11, padding: "6px 8px", textAlign: "left" }}>Export All as JSON</button>
+                  <button onClick={() => { skipWarn.current = false; localStorage.removeItem(KEYS.skipWarn); toast("Send warning re-enabled", "success"); }} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 11, padding: "6px 8px", textAlign: "left" }}>Reset Send Warning</button>
                 </div>
               )}
             </div>
@@ -1719,446 +1237,158 @@ export default function MeetingListener() {
         )}
 
         {/* Main content */}
-        <main
-          style={{
-            flex: 1,
-            padding: isMobile ? 12 : 24,
-            maxWidth: 800,
-            width: "100%",
-            overflowY: "auto",
-          }}
-        >
+        <main style={{ flex: 1, padding: isMobile ? 12 : 24, maxWidth: 800, width: "100%", overflowY: "auto" }}>
           {!currentId ? (
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                justifyContent: "center",
-                height: "60vh",
-                textAlign: "center",
-                gap: 16,
-              }}
-            >
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "60vh", textAlign: "center", gap: 16 }}>
               <div style={{ fontSize: 48, opacity: 0.3 }}>🎙</div>
-              <h2
-                style={{
-                  color: COLORS.text,
-                  fontSize: 18,
-                  fontWeight: 600,
-                }}
-              >
-                No meeting selected
-              </h2>
-              <p
-                style={{
-                  color: COLORS.muted,
-                  fontSize: 14,
-                  maxWidth: 320,
-                  lineHeight: 1.5,
-                }}
-              >
-                Create a new meeting to start recording and transcribing.
-              </p>
-              <button
-                onClick={handleNewMeeting}
-                style={{
-                  ...BTN,
-                  background: COLORS.accent,
-                  color: "#fff",
-                  padding: "10px 24px",
-                  fontSize: 14,
-                  minHeight: 44,
-                }}
-              >
-                + New Meeting
-              </button>
+              <h2 style={{ color: COLORS.text, fontSize: 18, fontWeight: 600 }}>No meeting selected</h2>
+              <p style={{ color: COLORS.muted, fontSize: 14, maxWidth: 320, lineHeight: 1.5 }}>Create a new meeting to start recording and transcribing.</p>
+              <button onClick={handleNewMeeting} style={{ ...BTN, background: COLORS.accent, color: "#fff", padding: "10px 24px", fontSize: 14, minHeight: 44 }}>+ New Meeting</button>
             </div>
           ) : (
             <>
-              {/* Meeting title */}
-              <input
-                value={current?.title || ""}
-                onChange={handleTitleChange}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  outline: "none",
-                  fontSize: 20,
-                  fontWeight: 700,
-                  color: COLORS.text,
-                  width: "100%",
-                  padding: "4px 0",
-                  marginBottom: 16,
-                }}
-                placeholder="Meeting title…"
-              />
+              {/* Title */}
+              <input value={current?.title || ""} onChange={handleTitleChange} style={{ background: "transparent", border: "none", outline: "none", fontSize: 20, fontWeight: 700, color: COLORS.text, width: "100%", padding: "4px 0", marginBottom: 12 }} placeholder="Meeting title…" />
 
-              {/* Recording controls */}
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 12,
-                  marginBottom: 12,
-                  flexWrap: "wrap",
-                }}
-              >
+              {/* Controls */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
                 {recording && !paused && (
-                  <span
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 6,
-                    }}
-                  >
-                    <span
-                      style={{
-                        display: "inline-block",
-                        width: 8,
-                        height: 8,
-                        borderRadius: "50%",
-                        background: COLORS.red,
-                        animation: "mlpulse 1.2s ease-in-out infinite",
-                      }}
-                    />
-                    <span
-                      style={{
-                        fontSize: 12,
-                        color: COLORS.red,
-                        fontWeight: 600,
-                      }}
-                    >
-                      Recording
-                    </span>
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: COLORS.red, animation: "mlpulse 1.2s ease-in-out infinite" }} />
+                    <span style={{ fontSize: 12, color: COLORS.red, fontWeight: 600 }}>Recording</span>
                   </span>
                 )}
-                {paused && (
-                  <span
-                    style={{
-                      fontSize: 12,
-                      color: COLORS.yellow,
-                      fontWeight: 600,
-                    }}
-                  >
-                    Paused
-                  </span>
-                )}
-                <span
-                  style={{
-                    fontSize: 13,
-                    color: COLORS.muted,
-                    fontVariantNumeric: "tabular-nums",
-                  }}
-                >
-                  {fmtDuration(elapsed)}
-                </span>
-                <span style={{ fontSize: 12, color: COLORS.dim }}>
-                  {words} word{words !== 1 ? "s" : ""}
-                </span>
+                {paused && <span style={{ fontSize: 12, color: COLORS.yellow, fontWeight: 600 }}>Paused</span>}
+                <span style={{ fontSize: 13, color: COLORS.muted, fontVariantNumeric: "tabular-nums" }}>{fmtDuration(elapsed)}</span>
+                <span style={{ fontSize: 12, color: COLORS.dim }}>{words} word{words !== 1 ? "s" : ""}</span>
 
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 6,
-                    marginLeft: "auto",
-                  }}
-                >
-                  {!recording && !paused && (
-                    <button
-                      onClick={handleStart}
-                      style={{
-                        ...BTN,
-                        background: COLORS.accent,
-                        color: "#fff",
-                        minHeight: 44,
-                      }}
-                    >
-                      Start
-                    </button>
-                  )}
+                {liveNotesOn && recording && <span style={{ fontSize: 11, color: COLORS.green, fontWeight: 500 }}>AI Notes ON</span>}
+
+                <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
+                  {!recording && !paused && <button onClick={handleStart} style={{ ...BTN, background: COLORS.accent, color: "#fff", minHeight: 44 }}>Start</button>}
                   {recording && !paused && (
                     <>
-                      <button
-                        onClick={handlePause}
-                        style={{
-                          ...BTN,
-                          background: COLORS.card,
-                          border: `1px solid ${COLORS.border}`,
-                          color: COLORS.text,
-                          minHeight: 44,
-                        }}
-                      >
-                        Pause
-                      </button>
-                      <button
-                        onClick={handleStop}
-                        style={{
-                          ...BTN,
-                          background: COLORS.card,
-                          border: `1px solid ${COLORS.border}`,
-                          color: COLORS.text,
-                          minHeight: 44,
-                        }}
-                      >
-                        Stop
-                      </button>
+                      <button onClick={handlePause} style={{ ...BTN, background: COLORS.card, border: `1px solid ${COLORS.border}`, color: COLORS.text, minHeight: 44 }}>Pause</button>
+                      <button onClick={handleStop} style={{ ...BTN, background: COLORS.card, border: `1px solid ${COLORS.border}`, color: COLORS.text, minHeight: 44 }}>Stop</button>
                     </>
                   )}
                   {paused && (
                     <>
-                      <button
-                        onClick={handleResume}
-                        style={{
-                          ...BTN,
-                          background: COLORS.accent,
-                          color: "#fff",
-                          minHeight: 44,
-                        }}
-                      >
-                        Resume
-                      </button>
-                      <button
-                        onClick={handleStop}
-                        style={{
-                          ...BTN,
-                          background: COLORS.card,
-                          border: `1px solid ${COLORS.border}`,
-                          color: COLORS.text,
-                          minHeight: 44,
-                        }}
-                      >
-                        Stop
-                      </button>
+                      <button onClick={handleResume} style={{ ...BTN, background: COLORS.accent, color: "#fff", minHeight: 44 }}>Resume</button>
+                      <button onClick={handleStop} style={{ ...BTN, background: COLORS.card, border: `1px solid ${COLORS.border}`, color: COLORS.text, minHeight: 44 }}>Stop</button>
                     </>
                   )}
                 </div>
               </div>
 
-              {/* Keyboard hints */}
-              <div
-                style={{
-                  fontSize: 11,
-                  color: COLORS.dim,
-                  marginBottom: 12,
-                }}
-              >
-                <span
-                  style={{
-                    background: COLORS.card,
-                    padding: "2px 6px",
-                    borderRadius: 3,
-                    marginRight: 8,
-                  }}
-                >
-                  Space
-                </span>
-                record
-                <span
-                  style={{
-                    background: COLORS.card,
-                    padding: "2px 6px",
-                    borderRadius: 3,
-                    marginLeft: 12,
-                    marginRight: 8,
-                  }}
-                >
-                  {navigator.platform?.includes("Mac") ? "⌘" : "Ctrl"}+S
-                </span>
-                summarize
-                <span
-                  style={{
-                    background: COLORS.card,
-                    padding: "2px 6px",
-                    borderRadius: 3,
-                    marginLeft: 12,
-                    marginRight: 8,
-                  }}
-                >
-                  Esc
-                </span>
-                stop
+              {/* Keyboard hints + live notes toggle */}
+              <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 11, color: COLORS.dim, marginBottom: 10, flexWrap: "wrap" }}>
+                <span><span style={{ background: COLORS.card, padding: "2px 6px", borderRadius: 3, marginRight: 4 }}>Space</span>record</span>
+                <span><span style={{ background: COLORS.card, padding: "2px 6px", borderRadius: 3, marginRight: 4 }}>{navigator.platform?.includes("Mac") ? "⌘" : "Ctrl"}+S</span>summarize</span>
+                <span><span style={{ background: COLORS.card, padding: "2px 6px", borderRadius: 3, marginRight: 4 }}>Esc</span>stop</span>
+                <label style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 4, cursor: "pointer", color: COLORS.muted }}>
+                  <input type="checkbox" checked={liveNotesOn} onChange={(e) => setLiveNotesOn(e.target.checked)} />
+                  Live AI Notes
+                </label>
               </div>
 
-              {/* Recording error */}
-              {recError && (
-                <div
-                  style={{
-                    background: COLORS.red + "18",
-                    border: `1px solid ${COLORS.red}33`,
-                    borderRadius: 8,
-                    padding: "10px 14px",
-                    marginBottom: 12,
-                    fontSize: 13,
-                    color: COLORS.red,
-                  }}
-                >
-                  {recError}
+              {recError && <div style={{ background: COLORS.red + "18", border: `1px solid ${COLORS.red}33`, borderRadius: 8, padding: "10px 14px", marginBottom: 10, fontSize: 13, color: COLORS.red }}>{recError}</div>}
+
+              {/* Search bar */}
+              <div style={{ marginBottom: 8 }}>
+                <input value={searchQ} onChange={(e) => setSearchQ(e.target.value)} placeholder="Search transcript…" style={{ width: "100%", background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: "6px 10px", color: COLORS.text, fontSize: 12, outline: "none" }} />
+                {searchQ && <span style={{ fontSize: 11, color: COLORS.muted, marginLeft: 8 }}>{filteredSegs.length} match{filteredSegs.length !== 1 ? "es" : ""}</span>}
+              </div>
+
+              {/* Speaker legend + edit */}
+              {uniqueSpeakers.length > 1 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                  {uniqueSpeakers.map((n) => (
+                    <span key={n} style={{ fontSize: 11, color: speakerColor(n), fontWeight: 600 }}>
+                      {speakerNames[n] || `Speaker ${n}`}
+                    </span>
+                  ))}
+                  <button onClick={() => setEditingSpeakers(!editingSpeakers)} style={{ ...BTN, background: "transparent", border: "none", color: COLORS.muted, fontSize: 11, padding: "2px 4px" }}>
+                    {editingSpeakers ? "Done" : "Rename"}
+                  </button>
+                </div>
+              )}
+              {editingSpeakers && uniqueSpeakers.length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 10, padding: 8, background: COLORS.card, borderRadius: 6 }}>
+                  {uniqueSpeakers.map((n) => (
+                    <div key={n} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 12, color: speakerColor(n), fontWeight: 600, width: 70 }}>Speaker {n}</span>
+                      <input value={speakerNames[n] || ""} onChange={(e) => setSpeakerNames((prev) => ({ ...prev, [n]: e.target.value }))} placeholder={`Speaker ${n}`} style={{ flex: 1, background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 4, padding: "4px 8px", color: COLORS.text, fontSize: 12, outline: "none" }} />
+                    </div>
+                  ))}
                 </div>
               )}
 
               {/* Transcript pane */}
-              <div
-                ref={paneRef}
-                onScroll={handlePaneScroll}
-                style={{
-                  background: COLORS.card,
-                  border: `1px solid ${COLORS.border}`,
-                  borderRadius: 10,
-                  padding: 16,
-                  minHeight: 200,
-                  maxHeight: 400,
-                  overflowY: "auto",
-                  fontSize: 14,
-                  lineHeight: 1.7,
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                }}
-              >
-                {!transcript && !interimText && (
-                  <span style={{ color: COLORS.dim }}>
-                    {recording
-                      ? "Listening…"
-                      : "Hit Start to begin recording."}
-                  </span>
-                )}
-                <span style={{ color: COLORS.text }}>{transcript}</span>
-                {interimText && (
-                  <span style={{ color: COLORS.muted }}>{interimText}</span>
+              <div ref={paneRef} onScroll={handlePaneScroll} style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 10, padding: 12, minHeight: 200, maxHeight: 400, overflowY: "auto" }}>
+                {showPolished && polishedText ? (
+                  <div style={{ fontSize: 14, color: COLORS.text, lineHeight: 1.7, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{polishedText}</div>
+                ) : (
+                  <>
+                    {filteredSegs.length === 0 && !interimText && (
+                      <span style={{ color: COLORS.dim }}>{recording ? "Listening…" : segments.length === 0 ? "Hit Start to begin recording." : "No matches."}</span>
+                    )}
+                    {filteredSegs.map((seg) => (
+                      <SegmentRow key={seg.id} segment={seg} name={speakerNames[seg.speaker]} searchQ={searchQ} onHighlight={handleHighlight} />
+                    ))}
+                    {interimText && (
+                      <div style={{ display: "flex", gap: 10, padding: "6px 0", paddingLeft: 11 }}>
+                        <div style={{ flexShrink: 0, width: 44 }} />
+                        <div style={{ fontSize: 14, color: COLORS.muted, lineHeight: 1.6 }}>{interimText}</div>
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
 
-              {/* Transcript actions */}
-              {transcript && (
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 6,
-                    marginTop: 8,
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <button
-                    onClick={handleCopy}
-                    style={{
-                      ...BTN,
-                      background: "transparent",
-                      border: `1px solid ${COLORS.border}`,
-                      color: COLORS.text,
-                      fontSize: 12,
-                    }}
-                  >
-                    Copy
-                  </button>
-                  <button
-                    onClick={handleDownload}
-                    style={{
-                      ...BTN,
-                      background: "transparent",
-                      border: `1px solid ${COLORS.border}`,
-                      color: COLORS.text,
-                      fontSize: 12,
-                    }}
-                  >
-                    Download .txt
-                  </button>
-                  <button
-                    onClick={handleClear}
-                    style={{
-                      ...BTN,
-                      background: "transparent",
-                      border: `1px solid ${COLORS.red}33`,
-                      color: COLORS.red,
-                      fontSize: 12,
-                    }}
-                  >
-                    Clear
-                  </button>
+              {/* Polished toggle */}
+              {polishedText && (
+                <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                  <button onClick={() => setShowPolished(false)} style={{ ...BTN, background: !showPolished ? COLORS.accent + "22" : "transparent", border: `1px solid ${!showPolished ? COLORS.accent + "44" : COLORS.border}`, color: !showPolished ? COLORS.accent : COLORS.text, fontSize: 11, padding: "4px 10px" }}>Timestamped</button>
+                  <button onClick={() => setShowPolished(true)} style={{ ...BTN, background: showPolished ? COLORS.accent + "22" : "transparent", border: `1px solid ${showPolished ? COLORS.accent + "44" : COLORS.border}`, color: showPolished ? COLORS.accent : COLORS.text, fontSize: 11, padding: "4px 10px" }}>Polished</button>
                 </div>
               )}
 
-              {/* Summarize section */}
-              <div
-                style={{
-                  marginTop: 24,
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 10,
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 8,
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <input
-                    value={focusInstr}
-                    onChange={(e) => setFocusInstr(e.target.value)}
-                    placeholder="Focus: e.g. 'risks and deadlines'"
-                    style={{
-                      flex: 1,
-                      minWidth: 180,
-                      background: COLORS.card,
-                      border: `1px solid ${COLORS.border}`,
-                      borderRadius: 6,
-                      padding: "8px 12px",
-                      color: COLORS.text,
-                      fontSize: 13,
-                      outline: "none",
-                    }}
-                  />
-                  <button
-                    onClick={handleSummarize}
-                    disabled={summarizing || !transcript.trim()}
-                    style={{
-                      ...BTN,
-                      background: summarizing
-                        ? COLORS.accentDim
-                        : COLORS.accent,
-                      color: "#fff",
-                      padding: "8px 20px",
-                      opacity: summarizing || !transcript.trim() ? 0.5 : 1,
-                      cursor:
-                        summarizing || !transcript.trim()
-                          ? "not-allowed"
-                          : "pointer",
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 8,
-                      minHeight: 44,
-                    }}
-                  >
+              {/* Transcript actions */}
+              {segments.length > 0 && (
+                <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+                  <button onClick={handleCopy} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 12 }}>Copy</button>
+                  <button onClick={handleDownload} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 12 }}>Download .txt</button>
+                  <button onClick={handlePolish} disabled={polishing} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.blue}44`, color: COLORS.blue, fontSize: 12, opacity: polishing ? 0.5 : 1, cursor: polishing ? "not-allowed" : "pointer", display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    {polishing && <Spinner size={12} />}
+                    {polishing ? "Polishing…" : "Polish with AI"}
+                  </button>
+                  <button onClick={handleClear} style={{ ...BTN, background: "transparent", border: `1px solid ${COLORS.red}33`, color: COLORS.red, fontSize: 12 }}>Clear</button>
+                </div>
+              )}
+
+              {/* AI Notes */}
+              <Section title="AI Notes" badge={liveNotes.length || null} defaultOpen={liveNotes.length > 0}>
+                <LiveNotesPanel notes={liveNotes} />
+              </Section>
+
+              {/* Summarize */}
+              <Section title="Summary" badge={sumData ? "ready" : null} defaultOpen={true}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+                  <input value={focusInstr} onChange={(e) => setFocusInstr(e.target.value)} placeholder="Focus: e.g. 'risks and deadlines'" style={{ flex: 1, minWidth: 180, background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: "8px 12px", color: COLORS.text, fontSize: 13, outline: "none" }} />
+                  <button onClick={handleSummarize} disabled={summarizing || segments.length === 0} style={{ ...BTN, background: summarizing ? COLORS.accentDim : COLORS.accent, color: "#fff", padding: "8px 20px", opacity: summarizing || segments.length === 0 ? 0.5 : 1, cursor: summarizing || segments.length === 0 ? "not-allowed" : "pointer", display: "inline-flex", alignItems: "center", gap: 8, minHeight: 44 }}>
                     {summarizing && <Spinner size={14} />}
                     {summarizing ? "Summarizing…" : "✦ Summarize"}
                   </button>
                 </div>
+                {sumError && <div style={{ background: COLORS.red + "18", border: `1px solid ${COLORS.red}33`, borderRadius: 8, padding: "10px 14px", fontSize: 13, color: COLORS.red, wordBreak: "break-word", marginBottom: 10 }}>{sumError}</div>}
+                {sumData && <SummaryView summary={sumData} onCopyMd={handleCopyMd} onDownloadMd={handleDownloadMd} />}
+              </Section>
 
-                {sumError && (
-                  <div
-                    style={{
-                      background: COLORS.red + "18",
-                      border: `1px solid ${COLORS.red}33`,
-                      borderRadius: 8,
-                      padding: "10px 14px",
-                      fontSize: 13,
-                      color: COLORS.red,
-                      wordBreak: "break-word",
-                    }}
-                  >
-                    {sumError}
-                  </div>
-                )}
-
-                {sumData && (
-                  <SummaryView
-                    summary={sumData}
-                    onCopyMd={handleCopyMd}
-                    onDownloadMd={handleDownloadMd}
-                  />
-                )}
-              </div>
+              {/* Chat */}
+              <Section title="Ask about this meeting" badge={chatMsgs.length || null}>
+                <ChatPanel messages={chatMsgs} input={chatInput} onInput={setChatInput} onSend={handleChat} loading={chatLoading} />
+              </Section>
             </>
           )}
         </main>
