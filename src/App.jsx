@@ -1,7 +1,7 @@
-import ClaudeVideoIntel from "./ClaudeVideoIntel";
+import MeetingListener from "./MeetingListener";
 
 function App() {
-  return <ClaudeVideoIntel />;
+  return <MeetingListener />;
 }
 
 export default App;
